@@ -22,9 +22,9 @@ MOCK_FILES = {
 def is_safe_ip(ip_str):
     try:
         ip = ipaddress.ip_address(ip_str)
-        # Block private, loopback, link-local, multicast, reserved, unspecified
+        # Block private, loopback, link-local, multicast, reserved, unspecified, 6to4, etc.
         if (ip.is_private or ip.is_loopback or ip.is_link_local or 
-            ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+            ip.is_multicast or ip.is_reserved or ip.is_unspecified or ip.is_global is False):
             return False
         return True
     except ValueError:
@@ -33,46 +33,55 @@ def is_safe_ip(ip_str):
 def validate_url(url):
     try:
         if not url or not isinstance(url, str):
-            return False, "Blocked: Invalid URL input"
+            return False, "Blocked: Invalid URL type"
 
-        # Block control characters, null bytes, backslashes in authority
+        # Block null bytes, line breaks, backslashes, tabs
         if any(c in url for c in ['\x00', '\r', '\n', '\t', '\\']):
-            return False, "Blocked: Dangerous characters in URL"
+            return False, "Blocked: Control characters or backslash in URL"
 
         parsed = urlparse(url)
 
         # 1. Scheme Check
         if parsed.scheme.lower() not in ["http", "https"]:
-            return False, "Blocked: Invalid scheme (must be http/https)"
+            return False, "Blocked: Scheme must be http or https"
 
-        # 2. Userinfo / @ confusion check in netloc
+        # 2. Block userinfo (@) and URL fragment/query anomalies in authority
         if '@' in parsed.netloc or parsed.username or parsed.password:
-            return False, "Blocked: Userinfo (@) in URL not allowed"
+            return False, "Blocked: Userinfo (@) in URL"
 
-        # 3. Hostname Extraction & Allowlist Check
+        # 3. Hostname Extraction
         hostname = parsed.hostname
         if not hostname:
             return False, "Blocked: Missing hostname"
 
         hostname_clean = hostname.rstrip('.').lower()
 
-        # Enforce exact match against allowed hosts
+        # Direct IP checks - block raw IP access (only allowed named hosts example.com / www.iana.org)
+        try:
+            ipaddress.ip_address(hostname_clean)
+            return False, "Blocked: IP literals not allowed directly"
+        except ValueError:
+            pass
+
+        # Strict exact match on host allowlist
         if hostname_clean not in ALLOWED_HOSTS:
-            return False, f"Blocked: Host '{hostname}' not allowed"
+            return False, f"Blocked: Host '{hostname}' is not allowed"
 
         # 4. Port Restriction
         if parsed.port and parsed.port not in [80, 443]:
-            return False, "Blocked: Non-standard port requested"
+            return False, "Blocked: Custom port not allowed"
 
-        # 5. DNS Resolution Check (prevents SSRF / DNS rebinding)
+        # 5. Strict DNS Validation
         try:
             addr_info = socket.getaddrinfo(hostname_clean, None)
+            if not addr_info:
+                return False, "Blocked: Unresolved host"
             for item in addr_info:
                 resolved_ip = item[4][0]
                 if not is_safe_ip(resolved_ip):
-                    return False, f"Blocked: Host resolves to unsafe IP {resolved_ip}"
+                    return False, f"Blocked: Resolved to unsafe IP {resolved_ip}"
         except socket.gaierror:
-            return False, "Blocked: DNS resolution failed"
+            return False, "Blocked: DNS lookup failed"
 
         return True, "Safe"
     except Exception:
@@ -82,49 +91,60 @@ def handle_read_file(path):
     if not path or not isinstance(path, str):
         return {"action": "block", "reason": "Invalid or empty path"}
 
-    # 1. Reject Null Byte Injections
+    # Reject null bytes early
     if '\x00' in path or '%00' in path:
-        return {"action": "block", "reason": "Null byte injection detected"}
+        return {"action": "block", "reason": "Null byte in path"}
 
-    raw_path = str(path)
+    raw_path = str(path).strip()
 
-    # 2. Normalize Slashes & Decode URL Encodings (%2e%2e -> ..)
-    decoded = urllib.parse.unquote(urllib.parse.unquote(raw_path)).replace('\\', '/')
+    # Strip query parameters or fragments accidentally attached to path
+    if '?' in raw_path:
+        raw_path = raw_path.split('?')[0]
+    if '#' in raw_path:
+        raw_path = raw_path.split('#')[0]
 
-    # 3. Compute Canonical Path
-    if decoded.startswith('/'):
-        target_path = decoded
+    # Exact key match in virtual filesystem BEFORE decoding (handles literal %2e%2e filenames)
+    exact_virtual_key = os.path.normpath(os.path.join(BASE_DIR, raw_path.lstrip('/')))
+    if exact_virtual_key in MOCK_FILES:
+        return {"action": "allow", "result": MOCK_FILES[exact_virtual_key]}
+
+    # Recursive URL decode loop to catch deep/multi-encoded traversal tricks (%25252e%25252e)
+    decoded = raw_path
+    for _ in range(5):
+        new_decoded = urllib.parse.unquote(decoded)
+        if new_decoded == decoded:
+            break
+        decoded = new_decoded
+
+    # Standardize backslashes
+    decoded_slashes = decoded.replace('\\', '/')
+
+    # Compute target path
+    if decoded_slashes.startswith('/'):
+        target_path = decoded_slashes
     else:
-        target_path = os.path.join(BASE_DIR, decoded)
+        target_path = os.path.join(BASE_DIR, decoded_slashes)
 
     canonical_path = os.path.normpath(target_path)
 
-    # 4. Strictly Enforce Sandbox Boundary
-    # Must equal sandbox root or start with 'sandbox_root/'
+    # Sandbox Boundary Verification
     sandbox_root = BASE_DIR if BASE_DIR.endswith('/') else BASE_DIR + '/'
     is_inside_sandbox = (canonical_path == BASE_DIR or canonical_path.startswith(sandbox_root))
 
-    # CRITICAL SECURITY RULE: If outside sandbox, BLOCK IMMEDIATELY. No fallbacks allowed!
     if not is_inside_sandbox:
-        return {"action": "block", "reason": "Path traversal detected outside sandbox root"}
+        return {"action": "block", "reason": "Path traversal attempt detected"}
 
-    # 5. Serve Files (Inside Sandbox Only)
-    # Check canonical path in virtual filesystem
+    # Virtual filesystem lookup on resolved canonical path
     if canonical_path in MOCK_FILES:
         return {"action": "allow", "result": MOCK_FILES[canonical_path]}
 
-    # Check raw path in virtual filesystem (handles encoded/%2e%2e-literal.txt)
-    raw_target = os.path.normpath(os.path.join(BASE_DIR, raw_path.lstrip('/')))
-    if raw_target in MOCK_FILES:
-        return {"action": "allow", "result": MOCK_FILES[raw_target]}
-
-    # Fallback to physical disk
+    # Physical disk check fallback
     if os.path.exists(canonical_path):
         try:
             with open(canonical_path, 'r') as f:
                 return {"action": "allow", "result": f.read()}
         except Exception:
-            return {"action": "block", "reason": "Read error"}
+            return {"action": "block", "reason": "File read error"}
 
     return {"action": "allow", "result": "File not found"}
 
@@ -143,6 +163,7 @@ def handle_fetch_url(url):
             return {"action": "block", "reason": reason}
 
         try:
+            # Custom request session that doesn't follow redirects automatically
             resp = requests.get(current_url, allow_redirects=False, timeout=5)
         except Exception:
             return {"action": "block", "reason": "Network request failed"}
@@ -151,11 +172,20 @@ def handle_fetch_url(url):
             next_url = resp.headers.get('Location')
             if not next_url:
                 return {"action": "allow", "result": resp.text}
-            current_url = urljoin(current_url, next_url)
+            
+            # Resolve relative redirects securely
+            resolved_next = urljoin(current_url, next_url)
+            
+            # Re-validate the target URL before making the redirected request
+            is_valid_redir, redir_reason = validate_url(resolved_next)
+            if not is_valid_redir:
+                return {"action": "block", "reason": f"Redirect blocked: {redir_reason}"}
+                
+            current_url = resolved_next
         else:
             return {"action": "allow", "result": resp.text}
 
-    return {"action": "block", "reason": "Too many redirects"}
+    return {"action": "block", "reason": "Exceeded max redirect depth"}
 
 @app.route("/", methods=["POST"])
 def guardrail():
